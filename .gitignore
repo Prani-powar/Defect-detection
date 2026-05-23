@@ -9,7 +9,7 @@ data/test/
 data/captured/
 downloads/
 
-models/*.keras
+# models/*.keras
 models/*.h5
 logs/*.csv
 logs/*.png
