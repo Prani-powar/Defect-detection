@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+
+data/raw/
+data/train/
+data/val/
+data/test/
+data/captured/
+downloads/
+
+models/*.keras
+models/*.h5
+logs/*.csv
+logs/*.png
+logs/*.txt
+logs/images/
