@@ -4,7 +4,10 @@ import shutil
 import subprocess
 import sys
 import time
-import winsound
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 import cv2
 import numpy as np
@@ -27,6 +30,8 @@ from src.utils import (
 
 
 st.set_page_config(page_title="Apple Inspection Dashboard", page_icon="A", layout="wide")
+
+CAMERA_BACKEND = cv2.CAP_DSHOW if sys.platform.startswith("win") else 0
 
 FEEDBACK_CSV_PATH = LOG_CSV_PATH.parent / "feedback.csv"
 FEEDBACK_FIELDS = [
@@ -270,6 +275,11 @@ def save_uploaded_image(uploaded_file) -> Path:
     return output_path
 
 
+def beep_for_rotten() -> None:
+    if winsound is not None:
+        winsound.Beep(1200, 500)
+
+
 def is_blank_frame(frame) -> bool:
     if frame is None:
         return True
@@ -279,7 +289,7 @@ def is_blank_frame(frame) -> bool:
 
 def capture_webcam_image(camera_index: int = 0, countdown_seconds: int = 0) -> Path:
     ensure_directories([LOG_IMAGE_DIR])
-    camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    camera = cv2.VideoCapture(camera_index, CAMERA_BACKEND)
     if not camera.isOpened():
         raise RuntimeError(
             f"Could not open webcam index {camera_index}. Try another camera number or close other camera apps."
@@ -357,7 +367,7 @@ def inspect_saved_image(
     model = cached_model()
     prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
     if prediction == "rotten":
-        winsound.Beep(1200, 500)
+        beep_for_rotten()
     counts = next_counts(history, prediction)
     write_prediction_log(
         str(image_path),
@@ -569,7 +579,7 @@ def render_live_inspection(labels: list[str]) -> None:
         close_panel()
         return
 
-    camera = cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
+    camera = cv2.VideoCapture(int(camera_index), CAMERA_BACKEND)
     if not camera.isOpened():
         st.session_state["live_running"] = False
         st.error(f"Could not open camera source {camera_index}. Try another source or close other camera apps.")
@@ -597,7 +607,7 @@ def render_live_inspection(labels: list[str]) -> None:
             history = load_history()
             prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
             if prediction == "rotten":
-                winsound.Beep(1200, 500)
+                beep_for_rotten()
             counts = next_counts(history, prediction)
             write_prediction_log(
                 str(image_path),
