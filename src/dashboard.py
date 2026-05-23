@@ -760,6 +760,206 @@ def render_live_inspection(labels: list[str]) -> None:
     close_panel()
 
 
+def open_camera(camera_index: int):
+    camera = cv2.VideoCapture(int(camera_index), CAMERA_BACKEND)
+    if not camera.isOpened():
+        raise RuntimeError(f"Could not open Camera {camera_index}.")
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    for _ in range(20):
+        camera.read()
+        time.sleep(0.03)
+    return camera
+
+
+def analyze_live_frame(frame, camera_name: str, labels: list[str]) -> dict:
+    image_path = save_frame(frame, camera_name.lower().replace(" ", "_"))
+    history = load_history()
+    model = cached_model()
+    prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
+    if prediction == "rotten":
+        beep_for_rotten()
+    counts = next_counts(history, prediction)
+    write_prediction_log(
+        str(image_path),
+        prediction,
+        confidence,
+        counts,
+        probabilities=probabilities,
+        source=camera_name,
+        original_filename=image_path.name,
+    )
+    return {
+        "camera": camera_name,
+        "prediction": prediction,
+        "is_rotten": prediction == "rotten",
+        "confidence": f"{confidence * 100:.2f}%",
+        "fresh_probability": f"{probabilities.get('fresh', 0.0) * 100:.2f}%",
+        "rotten_probability": f"{probabilities.get('rotten', 0.0) * 100:.2f}%",
+        "image_path": str(image_path),
+    }
+
+
+def render_dual_live_inspection(labels: list[str]) -> None:
+    open_panel()
+    section_header(
+        "Dual Camera Live Inspection",
+        "Use this for two webcams on the conveyor. Both cameras capture and analyze one frame every interval.",
+    )
+    st.markdown(
+        """
+        <div class="mobile-note">
+            Plug both webcams into this laptop/PC, test the camera numbers, then start dual inspection.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    control_col1, control_col2, control_col3, control_col4 = st.columns(4)
+    camera_a = control_col1.selectbox(
+        "Camera A",
+        [0, 1, 2, 3, 4, 5],
+        index=0,
+        format_func=lambda value: f"Camera {value}",
+        key="dual_camera_a",
+    )
+    camera_b = control_col2.selectbox(
+        "Camera B",
+        [0, 1, 2, 3, 4, 5],
+        index=1,
+        format_func=lambda value: f"Camera {value}",
+        key="dual_camera_b",
+    )
+    interval_seconds = control_col3.number_input(
+        "Seconds between photos",
+        min_value=1,
+        max_value=10,
+        value=1,
+        step=1,
+        key="dual_interval",
+    )
+    max_cycles = control_col4.number_input(
+        "Cycles this run",
+        min_value=1,
+        max_value=500,
+        value=60,
+        step=1,
+        key="dual_cycles",
+    )
+
+    button_col1, button_col2, button_col3 = st.columns(3)
+    if "dual_live_running" not in st.session_state:
+        st.session_state["dual_live_running"] = False
+    if "dual_live_results" not in st.session_state:
+        st.session_state["dual_live_results"] = []
+
+    if button_col1.button("Test Camera A", use_container_width=True):
+        try:
+            preview_path = test_camera_source(int(camera_a))
+            st.success(f"Camera {camera_a} works.")
+            st.image(str(preview_path), caption=f"Camera {camera_a} preview", use_container_width=True)
+        except RuntimeError as error:
+            st.error(str(error))
+
+    if button_col2.button("Test Camera B", use_container_width=True):
+        try:
+            preview_path = test_camera_source(int(camera_b))
+            st.success(f"Camera {camera_b} works.")
+            st.image(str(preview_path), caption=f"Camera {camera_b} preview", use_container_width=True)
+        except RuntimeError as error:
+            st.error(str(error))
+
+    if button_col3.button("Start Dual Live Inspection", use_container_width=True):
+        if int(camera_a) == int(camera_b):
+            st.error("Camera A and Camera B must be different.")
+        else:
+            st.session_state["dual_live_running"] = True
+            st.session_state["dual_live_results"] = []
+
+    if st.button("Stop Dual Live Inspection", use_container_width=True):
+        st.session_state["dual_live_running"] = False
+
+    latest_col1, latest_col2 = st.columns(2)
+    progress_box = st.empty()
+    table_box = st.empty()
+
+    if not st.session_state["dual_live_running"]:
+        if st.session_state["dual_live_results"]:
+            table_box.dataframe(pd.DataFrame(st.session_state["dual_live_results"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Dual camera inspection is stopped.")
+        close_panel()
+        return
+
+    camera_a_handle = None
+    camera_b_handle = None
+    try:
+        camera_a_handle = open_camera(int(camera_a))
+        camera_b_handle = open_camera(int(camera_b))
+
+        for cycle_number in range(1, int(max_cycles) + 1):
+            if not st.session_state.get("dual_live_running", False):
+                break
+
+            frame_a = capture_single_frame(camera_a_handle)
+            frame_b = capture_single_frame(camera_b_handle)
+            if frame_a is None or is_blank_frame(frame_a):
+                st.error(f"Camera {camera_a} returned a blank frame.")
+                break
+            if frame_b is None or is_blank_frame(frame_b):
+                st.error(f"Camera {camera_b} returned a blank frame.")
+                break
+
+            result_a = analyze_live_frame(frame_a, f"dual_camera_{camera_a}", labels)
+            result_b = analyze_live_frame(frame_b, f"dual_camera_{camera_b}", labels)
+            result_a["cycle"] = cycle_number
+            result_b["cycle"] = cycle_number
+            st.session_state["dual_live_results"].insert(0, result_b)
+            st.session_state["dual_live_results"].insert(0, result_a)
+            st.session_state["dual_live_results"] = st.session_state["dual_live_results"][:100]
+
+            with latest_col1:
+                result_card(
+                    {
+                        "original_filename": f"Camera {camera_a} cycle {cycle_number}",
+                        "image_path": result_a["image_path"],
+                        "predicted_class": result_a["prediction"],
+                        "is_rotten": result_a["is_rotten"],
+                        "confidence": float(result_a["confidence"].rstrip("%")) / 100,
+                        "fresh_probability": float(result_a["fresh_probability"].rstrip("%")) / 100,
+                        "rotten_probability": float(result_a["rotten_probability"].rstrip("%")) / 100,
+                    }
+                )
+            with latest_col2:
+                result_card(
+                    {
+                        "original_filename": f"Camera {camera_b} cycle {cycle_number}",
+                        "image_path": result_b["image_path"],
+                        "predicted_class": result_b["prediction"],
+                        "is_rotten": result_b["is_rotten"],
+                        "confidence": float(result_b["confidence"].rstrip("%")) / 100,
+                        "fresh_probability": float(result_b["fresh_probability"].rstrip("%")) / 100,
+                        "rotten_probability": float(result_b["rotten_probability"].rstrip("%")) / 100,
+                    }
+                )
+
+            progress_box.progress(cycle_number / int(max_cycles), text=f"Dual capture cycle {cycle_number} of {int(max_cycles)}")
+            table_box.dataframe(pd.DataFrame(st.session_state["dual_live_results"]), use_container_width=True, hide_index=True)
+            time.sleep(float(interval_seconds))
+
+        st.session_state["dual_live_running"] = False
+        st.success("Dual live inspection run finished.")
+    except RuntimeError as error:
+        st.session_state["dual_live_running"] = False
+        st.error(str(error))
+    finally:
+        if camera_a_handle is not None:
+            camera_a_handle.release()
+        if camera_b_handle is not None:
+            camera_b_handle.release()
+    close_panel()
+
+
 def render_website_camera(labels: list[str]) -> None:
     open_panel()
     section_header(
@@ -817,8 +1017,8 @@ def main() -> None:
     history = load_history()
     render_metrics(history)
 
-    inspect_tab, website_camera_tab, live_tab, learn_tab, history_tab = st.tabs(
-        ["Batch Inspection", "Website Camera", "Live Inspection", "Feedback & Learning", "History"]
+    inspect_tab, dual_live_tab, website_camera_tab, live_tab, learn_tab, history_tab = st.tabs(
+        ["Batch Inspection", "Dual Camera Live", "Website Camera", "Live Inspection", "Feedback & Learning", "History"]
     )
 
     with inspect_tab:
@@ -946,6 +1146,9 @@ def main() -> None:
 
     with live_tab:
         render_live_inspection(labels)
+
+    with dual_live_tab:
+        render_dual_live_inspection(labels)
 
     with website_camera_tab:
         render_website_camera(labels)
