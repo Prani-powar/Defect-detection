@@ -196,6 +196,73 @@ div[data-testid="stNumberInput"] label {
     color: #f8fafc;
     font-weight: 700;
 }
+.mobile-note {
+    border: 1px solid #375a7f;
+    border-left: 6px solid #38bdf8;
+    border-radius: 8px;
+    background: #102033;
+    padding: .9rem 1rem;
+    color: #e0f2fe;
+    margin: .75rem 0 1rem 0;
+}
+@media (max-width: 760px) {
+    .block-container {
+        padding: .75rem .7rem 1.5rem .7rem;
+        max-width: 100%;
+    }
+    .hero {
+        padding: 1rem;
+        margin-bottom: .8rem;
+    }
+    .hero h1 {
+        font-size: 1.45rem;
+        line-height: 1.18;
+    }
+    .hero p {
+        font-size: .92rem;
+    }
+    .section-title {
+        font-size: 1.12rem;
+    }
+    .section-copy {
+        font-size: .9rem;
+    }
+    .panel {
+        padding: .85rem;
+    }
+    .metric-card {
+        min-height: 76px;
+        padding: .72rem .8rem;
+        margin-bottom: .55rem;
+    }
+    .metric-value {
+        font-size: 1.55rem;
+    }
+    div[data-testid="stTabs"] div[role="tablist"] {
+        overflow-x: auto;
+        white-space: nowrap;
+        gap: .25rem;
+    }
+    div[data-testid="stTabs"] button {
+        min-width: max-content;
+        padding-left: .55rem;
+        padding-right: .55rem;
+        font-size: .85rem;
+    }
+    div.stButton > button, div[data-testid="stFormSubmitButton"] button {
+        min-height: 3rem;
+        width: 100%;
+    }
+    div[data-testid="stFileUploader"] section {
+        padding: .7rem;
+    }
+    .result-title, .result-line, .small-muted {
+        overflow-wrap: anywhere;
+    }
+    div[data-testid="stDataFrame"] {
+        overflow-x: auto;
+    }
+}
 </style>
 """
 
@@ -267,8 +334,9 @@ def opposite_label(label: str) -> str:
 
 def save_uploaded_image(uploaded_file) -> Path:
     ensure_directories([LOG_IMAGE_DIR])
-    suffix = Path(uploaded_file.name).suffix.lower() or ".jpg"
-    safe_name = Path(uploaded_file.name).stem.replace(" ", "_")[:40]
+    original_name = getattr(uploaded_file, "name", "mobile_camera.jpg") or "mobile_camera.jpg"
+    suffix = Path(original_name).suffix.lower() or ".jpg"
+    safe_name = Path(original_name).stem.replace(" ", "_")[:40]
     output_path = LOG_IMAGE_DIR / f"upload_{timestamp_string()}_{safe_name}{suffix}"
     with output_path.open("wb") as handle:
         shutil.copyfileobj(uploaded_file, handle)
@@ -333,6 +401,21 @@ def capture_webcam_image(camera_index: int = 0, countdown_seconds: int = 0) -> P
         output_path = LOG_IMAGE_DIR / f"webcam_{timestamp_string()}.jpg"
         cv2.imwrite(str(output_path), captured_frame)
         return output_path
+    finally:
+        camera.release()
+
+
+def test_camera_source(camera_index: int) -> Path:
+    camera = cv2.VideoCapture(camera_index, CAMERA_BACKEND)
+    if not camera.isOpened():
+        raise RuntimeError(f"Camera source {camera_index} could not be opened.")
+    try:
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        frame = capture_single_frame(camera, timeout_seconds=3.0)
+        if frame is None or is_blank_frame(frame):
+            raise RuntimeError(f"Camera source {camera_index} opened but returned a blank frame.")
+        return save_frame(frame, f"camera_test_{camera_index}")
     finally:
         camera.release()
 
@@ -549,9 +632,22 @@ def render_live_inspection(labels: list[str]) -> None:
         "Live Conveyor Inspection",
         "Use this when apples move in front of a fixed webcam. It captures one photo every second and logs each result.",
     )
+    st.markdown(
+        """
+        <div class="mobile-note">
+            Select the webcam facing the conveyor. If you have two webcams, test Camera 0 and Camera 1 first.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     control_col1, control_col2, control_col3 = st.columns(3)
-    camera_index = control_col1.selectbox("Live camera source", [0, 1, 2, 3], index=0)
+    camera_index = control_col1.selectbox(
+        "Live camera source",
+        [0, 1, 2, 3, 4, 5],
+        index=0,
+        format_func=lambda value: f"Camera {value}",
+    )
     interval_seconds = control_col2.number_input("Seconds between photos", min_value=1, max_value=10, value=1, step=1)
     max_photos = control_col3.number_input("Photos this run", min_value=1, max_value=500, value=60, step=1)
 
@@ -566,6 +662,13 @@ def render_live_inspection(labels: list[str]) -> None:
         st.session_state["live_results"] = []
     if stop_col.button("Stop Live Inspection", use_container_width=True):
         st.session_state["live_running"] = False
+    if st.button("Test Live Camera", use_container_width=True):
+        try:
+            preview_path = test_camera_source(int(camera_index))
+            st.success(f"Camera {camera_index} works.")
+            st.image(str(preview_path), caption=f"Camera {camera_index} preview", use_container_width=True)
+        except RuntimeError as error:
+            st.error(str(error))
 
     latest_box = st.empty()
     progress_box = st.empty()
@@ -657,6 +760,43 @@ def render_live_inspection(labels: list[str]) -> None:
     close_panel()
 
 
+def render_website_camera(labels: list[str]) -> None:
+    open_panel()
+    section_header(
+        "Website Camera",
+        "Use this on the deployed website. The browser opens the camera on your phone or laptop, then the app analyzes that photo.",
+    )
+    st.markdown(
+        """
+        <div class="mobile-note">
+            On the deployed website, the server cannot directly control your USB webcams. Use this browser camera option, or upload photos from your device.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    browser_photo = st.camera_input("Take apple photo with this device")
+    if st.button("Analyze Website Camera Photo", use_container_width=True):
+        if browser_photo is None:
+            st.warning("Take a camera photo first.")
+        else:
+            try:
+                saved_path = save_uploaded_image(browser_photo)
+                refreshed_history = load_history()
+                result = inspect_saved_image(
+                    saved_path,
+                    getattr(browser_photo, "name", "website_camera.jpg"),
+                    "website_camera",
+                    refreshed_history,
+                    labels,
+                )
+                st.session_state["batch_results"] = [result]
+                st.success("Website camera photo analyzed.")
+                result_card(result)
+            except FileNotFoundError as error:
+                st.error(str(error))
+    close_panel()
+
+
 def main() -> None:
     if "uploader_key" not in st.session_state:
         st.session_state["uploader_key"] = 0
@@ -677,8 +817,8 @@ def main() -> None:
     history = load_history()
     render_metrics(history)
 
-    inspect_tab, live_tab, learn_tab, history_tab = st.tabs(
-        ["Batch Inspection", "Live Inspection", "Feedback & Learning", "History"]
+    inspect_tab, website_camera_tab, live_tab, learn_tab, history_tab = st.tabs(
+        ["Batch Inspection", "Website Camera", "Live Inspection", "Feedback & Learning", "History"]
     )
 
     with inspect_tab:
@@ -707,16 +847,56 @@ def main() -> None:
                         st.error(str(error))
 
             st.divider()
-            section_header("Camera Capture", "Capture one photo from the webcam and analyze it immediately.")
+            section_header("Mobile Camera", "On phone, use this to take a photo with the browser camera and analyze it.")
+            st.markdown(
+                """
+                <div class="mobile-note">
+                    For mobile/cloud use, this is the best camera option. The OpenCV webcam buttons below are mainly for the local conveyor PC.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            mobile_photo = st.camera_input("Take one apple photo")
+            if st.button("Analyze Mobile Photo", use_container_width=True):
+                if mobile_photo is None:
+                    st.warning("Take a mobile camera photo first.")
+                else:
+                    try:
+                        saved_path = save_uploaded_image(mobile_photo)
+                        refreshed_history = load_history()
+                        result = inspect_saved_image(
+                            saved_path,
+                            getattr(mobile_photo, "name", "mobile_camera.jpg"),
+                            "mobile_camera",
+                            refreshed_history,
+                            labels,
+                        )
+                        st.session_state["batch_results"] = [result]
+                        st.rerun()
+                    except FileNotFoundError as error:
+                        st.error(str(error))
+
+            st.divider()
+            section_header("Multi-Camera Capture", "Choose which webcam should capture the apple image.")
             camera_index = st.selectbox(
                 "Camera source",
-                options=[0, 1, 2, 3],
+                options=[0, 1, 2, 3, 4, 5],
                 index=0,
-                help="If the saved photo is blank, try camera 1 or 2.",
+                format_func=lambda value: f"Camera {value}",
+                help="Try Camera 0, then 1, then 2 to find your USB webcams.",
             )
-            camera_col1, camera_col2 = st.columns(2)
-            instant_clicked = camera_col1.button("Instant Photo", use_container_width=True)
-            countdown_clicked = camera_col2.button("3 Second Countdown", use_container_width=True)
+            camera_col1, camera_col2, camera_col3 = st.columns(3)
+            test_clicked = camera_col1.button("Test Camera", use_container_width=True)
+            instant_clicked = camera_col2.button("Instant Photo", use_container_width=True)
+            countdown_clicked = camera_col3.button("3 Second Countdown", use_container_width=True)
+
+            if test_clicked:
+                try:
+                    preview_path = test_camera_source(camera_index)
+                    st.success(f"Camera {camera_index} works.")
+                    st.image(str(preview_path), caption=f"Camera {camera_index} preview", use_container_width=True)
+                except RuntimeError as error:
+                    st.error(str(error))
 
             if instant_clicked or countdown_clicked:
                 try:
@@ -766,6 +946,9 @@ def main() -> None:
 
     with live_tab:
         render_live_inspection(labels)
+
+    with website_camera_tab:
+        render_website_camera(labels)
 
     with learn_tab:
         open_panel()
