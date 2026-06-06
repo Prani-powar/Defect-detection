@@ -6,4 +6,5 @@ matplotlib
 scikit-learn
 pillow
 streamlit
+streamlit-webrtc
 kaggle

@@ -1,9 +1,9 @@
 from datetime import datetime
 from pathlib import Path
-import hashlib
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 try:
@@ -19,6 +19,15 @@ import streamlit.components.v1 as components
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.applications.mobilenet_v2 import decode_predictions, preprocess_input
 from tensorflow.keras.preprocessing import image as keras_image
+
+try:
+    import av
+    from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
+except ModuleNotFoundError:
+    av = None
+    VideoProcessorBase = object
+    WebRtcMode = None
+    webrtc_streamer = None
 
 try:
     import bootstrap  # noqa: F401
@@ -69,6 +78,7 @@ FRUIT_WORDS = {
 }
 NON_FRUIT_IMAGENET_THRESHOLD = 0.55
 NOT_FRUIT_MODEL_CONFIDENCE_THRESHOLD = 0.72
+RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
 CSS = """
 <style>
@@ -382,6 +392,11 @@ def detect_fruit_like(image_path: Path) -> tuple[bool, str, float]:
 
 
 def predict_with_not_fruit_check(image_path: Path, labels: list[str]) -> tuple[str, float, dict[str, float], str, float]:
+    if "not_fruit" in labels:
+        model = cached_model()
+        prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
+        return prediction, confidence, probabilities, "trained 3-class model", probabilities.get("not_fruit", 0.0)
+
     fruit_like, object_label, object_confidence = detect_fruit_like(image_path)
     if not fruit_like:
         return "not_fruit", object_confidence, {"not_fruit": 1.0}, object_label, object_confidence
@@ -561,6 +576,117 @@ def inspect_browser_camera_photo(uploaded_photo, source: str, labels: list[str],
     )
 
 
+class WebRtcConveyorProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.labels: list[str] = []
+        self.interval_seconds = 1.0
+        self.max_photos = 60
+        self.last_capture_at = 0.0
+        self.captured_count = 0
+        self.results: list[dict] = []
+        self.latest_result: dict | None = None
+        self.alert_token = 0
+        self.ready = False
+
+    def configure(self, labels: list[str], interval_seconds: float, max_photos: int) -> None:
+        with self.lock:
+            self.labels = labels
+            self.interval_seconds = max(0.5, float(interval_seconds))
+            self.max_photos = int(max_photos)
+            self.ready = True
+
+    def snapshot(self) -> tuple[dict | None, list[dict], int, int, int]:
+        with self.lock:
+            return (
+                self.latest_result,
+                list(self.results),
+                self.alert_token,
+                self.captured_count,
+                self.max_photos,
+            )
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+        now = time.time()
+        overlay_label = "Waiting"
+        overlay_color = (255, 190, 0)
+
+        should_capture = False
+        with self.lock:
+            if (
+                self.ready
+                and self.captured_count < self.max_photos
+                and now - self.last_capture_at >= self.interval_seconds
+            ):
+                self.last_capture_at = now
+                self.captured_count += 1
+                capture_number = self.captured_count
+                labels = list(self.labels)
+                should_capture = True
+            else:
+                capture_number = self.captured_count
+                labels = list(self.labels)
+                if self.latest_result:
+                    overlay_label = display_label(str(self.latest_result["predicted_class"]))
+
+        if should_capture and labels:
+            try:
+                image_path = save_frame(image, "webrtc_live")
+                prediction, confidence, probabilities, object_label, object_confidence = predict_with_not_fruit_check(image_path, labels)
+                counts = next_counts(load_history(), prediction)
+                write_prediction_log(
+                    str(image_path),
+                    prediction,
+                    confidence,
+                    counts,
+                    probabilities=probabilities,
+                    source="webrtc_live_inspection",
+                    original_filename=image_path.name,
+                )
+                result = {
+                    "original_filename": image_path.name,
+                    "image_path": str(image_path),
+                    "predicted_class": prediction,
+                    "is_rotten": prediction == "rotten",
+                    "confidence": confidence,
+                    "fresh_probability": probabilities.get("fresh", 0.0),
+                    "rotten_probability": probabilities.get("rotten", 0.0),
+                    "not_fruit_probability": probabilities.get("not_fruit", 0.0),
+                    "object_label": object_label,
+                    "object_confidence": object_confidence,
+                }
+                row = {
+                    "photo": capture_number,
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "result": display_label(prediction),
+                    "confidence": f"{confidence * 100:.2f}%",
+                    "image_path": str(image_path),
+                }
+                with self.lock:
+                    self.latest_result = result
+                    self.results.insert(0, row)
+                    self.results = self.results[:50]
+                    if prediction == "rotten":
+                        self.alert_token += 1
+                overlay_label = display_label(prediction)
+            except Exception as error:
+                overlay_label = f"Error: {error}"
+
+        if overlay_label == "Rotten":
+            overlay_color = (80, 80, 255)
+        elif overlay_label == "Fresh":
+            overlay_color = (80, 220, 80)
+        elif overlay_label == "Not a fruit":
+            overlay_color = (0, 180, 255)
+
+        cv2.rectangle(image, (12, 12), (min(image.shape[1] - 12, 520), 78), (15, 20, 27), -1)
+        cv2.putText(image, overlay_label, (24, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.1, overlay_color, 3)
+        cv2.putText(image, f"Captures: {capture_number}/{self.max_photos}", (24, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (235, 235, 235), 2)
+
+        return av.VideoFrame.from_ndarray(image, format="bgr24")
+
+
 def result_card(result: dict) -> None:
     label = str(result["predicted_class"])
     confidence = float(result["confidence"]) * 100
@@ -693,56 +819,72 @@ def close_panel() -> None:
 def render_browser_live_inspection(labels: list[str]) -> None:
     open_panel()
     section_header(
-        "Live Camera Inspection",
-        "Use this on the deployed website. The browser opens your device camera, then the app analyzes each captured photo.",
+        "Browser Conveyor Live Inspection",
+        "Use this on the deployed website. Your browser streams the selected webcam, and the app analyzes one frame every interval.",
     )
     st.info(
-        "On Streamlit Cloud, the server cannot open your laptop USB camera with camera source 0. "
-        "This browser camera uses the camera from the device you are viewing the website on."
+        "Choose your external webcam in the browser permission popup. This is the cloud workaround for conveyor live inspection."
     )
 
-    browser_photo = st.camera_input("Take one inspection photo", key="browser_live_camera")
-    auto_analyze = st.toggle("Analyze each new camera photo automatically", value=True)
-    analyze_clicked = st.button("Analyze Camera Photo", use_container_width=True)
+    interval_seconds = st.number_input("Seconds between analyzed frames", min_value=1, max_value=10, value=1, step=1)
+    max_photos = st.number_input("Frames this run", min_value=1, max_value=500, value=60, step=1)
 
-    if "browser_live_results" not in st.session_state:
-        st.session_state["browser_live_results"] = []
-
-    if browser_photo is None:
-        st.info("Allow camera permission in the browser, then take a photo.")
-        if st.session_state["browser_live_results"]:
-            st.dataframe(pd.DataFrame(st.session_state["browser_live_results"]), use_container_width=True, hide_index=True)
+    if webrtc_streamer is None:
+        st.warning("WebRTC is not installed yet. The snapshot camera below will still work after you allow camera permission.")
+        browser_photo = st.camera_input("Take one inspection photo", key="browser_live_camera_fallback")
+        if st.button("Analyze Camera Photo", use_container_width=True):
+            if browser_photo is None:
+                st.warning("Take a photo first.")
+            else:
+                result = inspect_browser_camera_photo(browser_photo, "browser_live_camera", labels, load_history())
+                st.session_state["batch_results"] = [result]
+                result_card(result)
         close_panel()
         return
 
-    photo_hash = hashlib.sha256(browser_photo.getvalue()).hexdigest()
-    should_analyze = analyze_clicked or (
-        auto_analyze and st.session_state.get("last_browser_live_hash") != photo_hash
+    ctx = webrtc_streamer(
+        key="apple-conveyor-webrtc",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=WebRtcConveyorProcessor,
+        async_processing=True,
     )
 
-    if should_analyze:
-        with st.spinner("Analyzing camera photo..."):
-            result = inspect_browser_camera_photo(browser_photo, "browser_live_camera", labels, load_history())
-        st.session_state["last_browser_live_hash"] = photo_hash
-        st.session_state["batch_results"] = [result]
-        st.session_state["browser_live_latest"] = result
-        st.session_state["browser_live_results"].insert(
-            0,
-            {
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "result": display_label(str(result["predicted_class"])),
-                "confidence": f"{float(result['confidence']) * 100:.2f}%",
-                "image_path": result["image_path"],
-            },
-        )
-        st.session_state["browser_live_results"] = st.session_state["browser_live_results"][:50]
+    latest_box = st.empty()
+    progress_box = st.empty()
+    table_box = st.empty()
 
-    latest = st.session_state.get("browser_live_latest")
-    if latest:
-        result_card(latest)
+    if ctx.video_processor:
+        ctx.video_processor.configure(labels, float(interval_seconds), int(max_photos))
 
-    if st.session_state["browser_live_results"]:
-        st.dataframe(pd.DataFrame(st.session_state["browser_live_results"]), use_container_width=True, hide_index=True)
+    if not ctx.state.playing:
+        st.info("Click START above, allow camera permission, then select your external webcam if the browser asks.")
+        close_panel()
+        return
+
+    while ctx.state.playing:
+        if not ctx.video_processor:
+            time.sleep(0.3)
+            continue
+
+        latest, rows, alert_token, captured_count, target_count = ctx.video_processor.snapshot()
+        if alert_token != st.session_state.get("last_webrtc_alert_token", 0):
+            st.session_state["last_webrtc_alert_token"] = alert_token
+            play_rotten_alert()
+
+        if latest:
+            st.session_state["batch_results"] = [latest]
+            with latest_box.container():
+                result_card(latest)
+        if target_count:
+            progress_box.progress(min(captured_count / target_count, 1.0), text=f"Analyzed {captured_count} of {target_count}")
+        if rows:
+            table_box.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if captured_count >= target_count:
+            st.success("Browser conveyor inspection run finished. Stop the stream or start a new run.")
+            break
+        time.sleep(0.5)
     close_panel()
 
 
