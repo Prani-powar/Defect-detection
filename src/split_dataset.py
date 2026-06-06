@@ -6,8 +6,10 @@ try:
     import bootstrap  # noqa: F401
 except ModuleNotFoundError:
     import src.bootstrap  # noqa: F401
-from config import CLASSES, RAW_DATA_DIR, TEST_DIR, TRAIN_DIR, VAL_DIR
-from src.utils import ensure_directories, image_files
+from config import CLASSES, MAX_IMAGES_PER_CLASS, RAW_DATA_DIR, TEST_DIR, TRAIN_DIR, VAL_DIR
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 RANDOM_SEED = 42
@@ -19,15 +21,21 @@ def clear_split_dirs() -> None:
     for split_dir in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
         for class_name in CLASSES:
             class_dir = split_dir / class_name
-            ensure_directories([class_dir])
+            class_dir.mkdir(parents=True, exist_ok=True)
             for image_path in image_files(class_dir):
                 image_path.unlink()
 
 
 def copy_files(files, output_dir: Path) -> None:
-    ensure_directories([output_dir])
+    output_dir.mkdir(parents=True, exist_ok=True)
     for source_path in files:
         shutil.copy2(source_path, output_dir / source_path.name)
+
+
+def image_files(folder: Path) -> list[Path]:
+    if not folder.exists():
+        return []
+    return sorted(path for path in folder.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS)
 
 
 def split_class(class_name: str) -> None:
@@ -38,6 +46,14 @@ def split_class(class_name: str) -> None:
         return
 
     random.Random(RANDOM_SEED).shuffle(files)
+    if MAX_IMAGES_PER_CLASS:
+        files = files[:MAX_IMAGES_PER_CLASS]
+
+    if len(files) < 5:
+        copy_files(files, TRAIN_DIR / class_name)
+        print(f"{class_name}: {len(files)} train, 0 val, 0 test")
+        return
+
     train_end = int(len(files) * TRAIN_RATIO)
     val_end = train_end + int(len(files) * VAL_RATIO)
 

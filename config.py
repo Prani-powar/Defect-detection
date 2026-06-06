@@ -4,14 +4,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Keep this list small for the first prototype. Add more labels later, for example:
-# CLASSES = ["fresh", "rotten", "bruised"]
+# CLASSES = ["fresh", "rotten", "not_fruit"]
 PRODUCT_NAME = "apple"
-CLASSES = ["fresh", "rotten"]
+CLASSES = ["fresh", "rotten", "not_fruit"]
 
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
-EPOCHS = 15
-FINE_TUNE_EPOCHS = 5
+EPOCHS = 6
+FINE_TUNE_EPOCHS = 2
+MAX_IMAGES_PER_CLASS = 1800
 CONFIDENCE_THRESHOLD = 0.75
 PREDICT_EVERY_N_FRAMES = 10
 COOLDOWN_SECONDS = 2

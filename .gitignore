@@ -1,4 +1,5 @@
 .venv/
+.train_packages/
 __pycache__/
 *.pyc
 

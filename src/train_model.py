@@ -1,6 +1,6 @@
-import matplotlib.pyplot as plt
+import csv
+import json
 import numpy as np
-from sklearn.metrics import classification_report, confusion_matrix
 import tensorflow as tf
 from tensorflow.keras import layers
 from tensorflow.keras.applications import MobileNetV2
@@ -21,10 +21,21 @@ from config import (
     TRAIN_DIR,
     VAL_DIR,
 )
-from src.utils import ensure_directories, save_labels
 
 
 AUTOTUNE = tf.data.AUTOTUNE
+HISTORY_CSV = MODEL_PATH.parent.parent / "logs" / "training_history.csv"
+REPORT_PATH = MODEL_PATH.parent.parent / "logs" / "classification_report.txt"
+
+
+def ensure_directories(paths) -> None:
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def save_labels(labels, path=MODEL_PATH.parent / "labels.json") -> None:
+    ensure_directories([path.parent])
+    path.write_text(json.dumps(labels, indent=2), encoding="utf-8")
 
 
 def build_dataset(folder, shuffle: bool):
@@ -57,6 +68,20 @@ def prepare_dataset(dataset, augment: bool = False):
     return dataset.map(prepare, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
 
 
+def class_weights_from_dataset(dataset) -> dict[int, float]:
+    class_ids = []
+    for _, labels in dataset:
+        class_ids.extend(np.argmax(labels.numpy(), axis=1))
+    if not class_ids:
+        return {}
+    counts = np.bincount(np.asarray(class_ids), minlength=len(CLASSES))
+    total = int(np.sum(counts))
+    weights = np.zeros(len(CLASSES), dtype=np.float32)
+    for index, count in enumerate(counts):
+        weights[index] = total / (len(CLASSES) * count) if count else 0.0
+    return {index: float(weight) for index, weight in enumerate(weights)}
+
+
 def build_model(num_classes: int):
     inputs = layers.Input(shape=(*IMAGE_SIZE, 3))
     base_model = MobileNetV2(include_top=False, weights="imagenet", input_tensor=inputs)
@@ -76,33 +101,26 @@ def build_model(num_classes: int):
 
 def plot_history(histories) -> None:
     ensure_directories([MODEL_PATH.parent, MODEL_PATH.parent.parent / "logs"])
-    logs_dir = MODEL_PATH.parent.parent / "logs"
-    accuracy = []
-    val_accuracy = []
-    loss = []
-    val_loss = []
+    rows = []
+    epoch_number = 1
     for history in histories:
-        accuracy.extend(history.history.get("accuracy", []))
-        val_accuracy.extend(history.history.get("val_accuracy", []))
-        loss.extend(history.history.get("loss", []))
-        val_loss.extend(history.history.get("val_loss", []))
+        history_data = history.history
+        for offset in range(len(history_data.get("loss", []))):
+            rows.append(
+                {
+                    "epoch": epoch_number,
+                    "accuracy": history_data.get("accuracy", [""])[offset],
+                    "val_accuracy": history_data.get("val_accuracy", [""])[offset],
+                    "loss": history_data.get("loss", [""])[offset],
+                    "val_loss": history_data.get("val_loss", [""])[offset],
+                }
+            )
+            epoch_number += 1
 
-    plt.figure(figsize=(10, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(accuracy, label="train accuracy")
-    plt.plot(val_accuracy, label="val accuracy")
-    plt.legend()
-    plt.title("Accuracy")
-
-    plt.subplot(1, 2, 2)
-    plt.plot(loss, label="train loss")
-    plt.plot(val_loss, label="val loss")
-    plt.legend()
-    plt.title("Loss")
-
-    plt.tight_layout()
-    plt.savefig(logs_dir / "training_curves.png", dpi=160)
-    plt.close()
+    with HISTORY_CSV.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["epoch", "accuracy", "val_accuracy", "loss", "val_loss"])
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def evaluate_model(model, test_dataset) -> None:
@@ -113,15 +131,27 @@ def evaluate_model(model, test_dataset) -> None:
         y_true.extend(np.argmax(labels.numpy(), axis=1))
         y_pred.extend(np.argmax(probabilities, axis=1))
 
-    report = classification_report(y_true, y_pred, target_names=CLASSES, digits=4)
-    matrix = confusion_matrix(y_true, y_pred)
-    logs_dir = MODEL_PATH.parent.parent / "logs"
-    ensure_directories([logs_dir])
-    (logs_dir / "classification_report.txt").write_text(
-        f"Classification report\n\n{report}\n\nConfusion matrix\n{matrix}\n",
-        encoding="utf-8",
-    )
-    print(report)
+    matrix = np.zeros((len(CLASSES), len(CLASSES)), dtype=int)
+    for actual, predicted in zip(y_true, y_pred):
+        matrix[int(actual), int(predicted)] += 1
+
+    lines = ["Classification report", ""]
+    for index, class_name in enumerate(CLASSES):
+        true_positive = matrix[index, index]
+        predicted_total = matrix[:, index].sum()
+        actual_total = matrix[index, :].sum()
+        precision = true_positive / predicted_total if predicted_total else 0.0
+        recall = true_positive / actual_total if actual_total else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
+        lines.append(
+            f"{class_name}: precision={precision:.4f}, recall={recall:.4f}, "
+            f"f1={f1:.4f}, support={actual_total}"
+        )
+    lines.extend(["", "Confusion matrix", str(matrix)])
+
+    ensure_directories([REPORT_PATH.parent])
+    REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
+    print("\n".join(lines))
     print("Confusion matrix:")
     print(matrix)
 
@@ -134,6 +164,7 @@ def main() -> None:
     train_raw = build_dataset(TRAIN_DIR, shuffle=True)
     val_raw = build_dataset(VAL_DIR, shuffle=False)
     test_raw = build_dataset(TEST_DIR, shuffle=False)
+    class_weight = class_weights_from_dataset(train_raw)
 
     train_dataset = prepare_dataset(train_raw, augment=True)
     val_dataset = prepare_dataset(val_raw)
@@ -149,6 +180,7 @@ def main() -> None:
         train_dataset,
         validation_data=val_dataset,
         epochs=EPOCHS,
+        class_weight=class_weight,
         callbacks=callbacks,
     )
 
@@ -164,6 +196,7 @@ def main() -> None:
         train_dataset,
         validation_data=val_dataset,
         epochs=FINE_TUNE_EPOCHS,
+        class_weight=class_weight,
         callbacks=callbacks,
     )
 

@@ -1,18 +1,18 @@
-﻿from datetime import datetime
+from datetime import datetime
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
-try:
-    import winsound
-except ImportError:
-    winsound = None
+import winsound
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.applications.mobilenet_v2 import decode_predictions, preprocess_input
+from tensorflow.keras.preprocessing import image as keras_image
 
 try:
     import bootstrap  # noqa: F401
@@ -31,8 +31,6 @@ from src.utils import (
 
 st.set_page_config(page_title="Apple Inspection Dashboard", page_icon="A", layout="wide")
 
-CAMERA_BACKEND = cv2.CAP_DSHOW if sys.platform.startswith("win") else 0
-
 FEEDBACK_CSV_PATH = LOG_CSV_PATH.parent / "feedback.csv"
 FEEDBACK_FIELDS = [
     "timestamp",
@@ -44,6 +42,27 @@ FEEDBACK_FIELDS = [
     "ai_was_correct",
     "training_copy_path",
 ]
+
+DISPLAY_LABELS = {
+    "fresh": "Fresh",
+    "rotten": "Rotten",
+    "not_fruit": "Not a fruit",
+    "uncertain": "Not sure",
+}
+FRUIT_WORDS = {
+    "apple",
+    "granny_smith",
+    "banana",
+    "orange",
+    "lemon",
+    "pineapple",
+    "pomegranate",
+    "fig",
+    "strawberry",
+    "custard_apple",
+}
+NON_FRUIT_IMAGENET_THRESHOLD = 0.55
+NOT_FRUIT_MODEL_CONFIDENCE_THRESHOLD = 0.72
 
 CSS = """
 <style>
@@ -151,6 +170,13 @@ CSS = """
     color: #f1f5f9;
     font-weight: 650;
 }
+.verdict-text {
+    color: #ffffff;
+    font-size: 1.45rem;
+    line-height: 1.15;
+    font-weight: 850;
+    margin: .2rem 0 .35rem 0;
+}
 .small-muted { color: #cbd5e1; font-size: .9rem; }
 div[data-testid="stTabs"] button {
     font-weight: 700;
@@ -196,73 +222,6 @@ div[data-testid="stNumberInput"] label {
     color: #f8fafc;
     font-weight: 700;
 }
-.mobile-note {
-    border: 1px solid #375a7f;
-    border-left: 6px solid #38bdf8;
-    border-radius: 8px;
-    background: #102033;
-    padding: .9rem 1rem;
-    color: #e0f2fe;
-    margin: .75rem 0 1rem 0;
-}
-@media (max-width: 760px) {
-    .block-container {
-        padding: .75rem .7rem 1.5rem .7rem;
-        max-width: 100%;
-    }
-    .hero {
-        padding: 1rem;
-        margin-bottom: .8rem;
-    }
-    .hero h1 {
-        font-size: 1.45rem;
-        line-height: 1.18;
-    }
-    .hero p {
-        font-size: .92rem;
-    }
-    .section-title {
-        font-size: 1.12rem;
-    }
-    .section-copy {
-        font-size: .9rem;
-    }
-    .panel {
-        padding: .85rem;
-    }
-    .metric-card {
-        min-height: 76px;
-        padding: .72rem .8rem;
-        margin-bottom: .55rem;
-    }
-    .metric-value {
-        font-size: 1.55rem;
-    }
-    div[data-testid="stTabs"] div[role="tablist"] {
-        overflow-x: auto;
-        white-space: nowrap;
-        gap: .25rem;
-    }
-    div[data-testid="stTabs"] button {
-        min-width: max-content;
-        padding-left: .55rem;
-        padding-right: .55rem;
-        font-size: .85rem;
-    }
-    div.stButton > button, div[data-testid="stFormSubmitButton"] button {
-        min-height: 3rem;
-        width: 100%;
-    }
-    div[data-testid="stFileUploader"] section {
-        padding: .7rem;
-    }
-    .result-title, .result-line, .small-muted {
-        overflow-wrap: anywhere;
-    }
-    div[data-testid="stDataFrame"] {
-        overflow-x: auto;
-    }
-}
 </style>
 """
 
@@ -270,6 +229,14 @@ div[data-testid="stNumberInput"] label {
 @st.cache_resource
 def cached_model():
     return load_trained_model()
+
+
+@st.cache_resource
+def cached_object_model():
+    try:
+        return MobileNetV2(weights="imagenet")
+    except Exception:
+        return None
 
 
 def empty_history() -> pd.DataFrame:
@@ -324,7 +291,8 @@ def next_counts(history: pd.DataFrame, prediction: str) -> dict[str, int]:
         "rotten": max_count(history, "rotten_count"),
         "uncertain": max_count(history, "uncertain_count"),
     }
-    counts[prediction] = counts.get(prediction, 0) + 1
+    count_key = prediction if prediction in {"fresh", "rotten"} else "uncertain"
+    counts[count_key] = counts.get(count_key, 0) + 1
     return counts
 
 
@@ -332,20 +300,71 @@ def opposite_label(label: str) -> str:
     return "rotten" if label == "fresh" else "fresh"
 
 
+def display_label(label: str) -> str:
+    return DISPLAY_LABELS.get(label, label.replace("_", " ").title())
+
+
+def status_class(label: str) -> str:
+    if label == "rotten":
+        return "status-rotten"
+    if label == "fresh":
+        return "status-fresh"
+    return "status-uncertain"
+
+
+def detect_fruit_like(image_path: Path) -> tuple[bool, str, float]:
+    object_model = cached_object_model()
+    if object_model is None:
+        return True, "object check unavailable", 0.0
+
+    try:
+        image = keras_image.load_img(image_path, target_size=(224, 224))
+        array = keras_image.img_to_array(image)
+        batch = np.expand_dims(array, axis=0)
+        batch = preprocess_input(batch)
+        predictions = object_model.predict(batch, verbose=0)
+        decoded = decode_predictions(predictions, top=10)[0]
+    except Exception:
+        return True, "object check failed", 0.0
+
+    top_label = decoded[0][1].lower()
+    top_score = float(decoded[0][2])
+    for _, label, score in decoded:
+        normalized = label.lower()
+        if any(word in normalized for word in FRUIT_WORDS):
+            return True, normalized, float(score)
+
+    if top_score >= NON_FRUIT_IMAGENET_THRESHOLD:
+        return False, top_label, top_score
+    return True, f"uncertain object: {top_label}", top_score
+
+
+def predict_with_not_fruit_check(image_path: Path, labels: list[str]) -> tuple[str, float, dict[str, float], str, float]:
+    fruit_like, object_label, object_confidence = detect_fruit_like(image_path)
+    if not fruit_like:
+        return "not_fruit", object_confidence, {"not_fruit": 1.0}, object_label, object_confidence
+
+    model = cached_model()
+    prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
+
+    if prediction == "not_fruit":
+        return prediction, confidence, probabilities, object_label, object_confidence
+
+    if confidence < NOT_FRUIT_MODEL_CONFIDENCE_THRESHOLD:
+        probabilities = {**probabilities, "not_fruit": 1.0 - confidence}
+        return "not_fruit", 1.0 - confidence, probabilities, object_label, object_confidence
+
+    return prediction, confidence, probabilities, object_label, object_confidence
+
+
 def save_uploaded_image(uploaded_file) -> Path:
     ensure_directories([LOG_IMAGE_DIR])
-    original_name = getattr(uploaded_file, "name", "mobile_camera.jpg") or "mobile_camera.jpg"
-    suffix = Path(original_name).suffix.lower() or ".jpg"
-    safe_name = Path(original_name).stem.replace(" ", "_")[:40]
+    suffix = Path(uploaded_file.name).suffix.lower() or ".jpg"
+    safe_name = Path(uploaded_file.name).stem.replace(" ", "_")[:40]
     output_path = LOG_IMAGE_DIR / f"upload_{timestamp_string()}_{safe_name}{suffix}"
     with output_path.open("wb") as handle:
         shutil.copyfileobj(uploaded_file, handle)
     return output_path
-
-
-def beep_for_rotten() -> None:
-    if winsound is not None:
-        winsound.Beep(1200, 500)
 
 
 def is_blank_frame(frame) -> bool:
@@ -357,7 +376,7 @@ def is_blank_frame(frame) -> bool:
 
 def capture_webcam_image(camera_index: int = 0, countdown_seconds: int = 0) -> Path:
     ensure_directories([LOG_IMAGE_DIR])
-    camera = cv2.VideoCapture(camera_index, CAMERA_BACKEND)
+    camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not camera.isOpened():
         raise RuntimeError(
             f"Could not open webcam index {camera_index}. Try another camera number or close other camera apps."
@@ -405,21 +424,6 @@ def capture_webcam_image(camera_index: int = 0, countdown_seconds: int = 0) -> P
         camera.release()
 
 
-def test_camera_source(camera_index: int) -> Path:
-    camera = cv2.VideoCapture(camera_index, CAMERA_BACKEND)
-    if not camera.isOpened():
-        raise RuntimeError(f"Camera source {camera_index} could not be opened.")
-    try:
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        frame = capture_single_frame(camera, timeout_seconds=3.0)
-        if frame is None or is_blank_frame(frame):
-            raise RuntimeError(f"Camera source {camera_index} opened but returned a blank frame.")
-        return save_frame(frame, f"camera_test_{camera_index}")
-    finally:
-        camera.release()
-
-
 def capture_single_frame(camera, timeout_seconds: float = 2.0):
     started = time.time()
     last_frame = None
@@ -447,10 +451,9 @@ def inspect_saved_image(
     history: pd.DataFrame,
     labels: list[str],
 ) -> dict:
-    model = cached_model()
-    prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
+    prediction, confidence, probabilities, object_label, object_confidence = predict_with_not_fruit_check(image_path, labels)
     if prediction == "rotten":
-        beep_for_rotten()
+        winsound.Beep(1200, 500)
     counts = next_counts(history, prediction)
     write_prediction_log(
         str(image_path),
@@ -469,6 +472,9 @@ def inspect_saved_image(
         "confidence": confidence,
         "fresh_probability": probabilities.get("fresh", 0.0),
         "rotten_probability": probabilities.get("rotten", 0.0),
+        "not_fruit_probability": probabilities.get("not_fruit", 0.0),
+        "object_label": object_label,
+        "object_confidence": object_confidence,
     }
 
 
@@ -501,14 +507,16 @@ def inspect_uploaded_files(uploaded_files: list, history: pd.DataFrame, labels: 
 def result_card(result: dict) -> None:
     label = str(result["predicted_class"])
     confidence = float(result["confidence"]) * 100
-    status_class = "status-rotten" if label == "rotten" else "status-fresh"
+    object_label = str(result.get("object_label", ""))
+    object_line = f'<div class="small-muted">Object check: {object_label}</div>' if object_label else ""
     st.markdown(
         f"""
         <div class="result-card">
-            <div class="{status_class}">
+            <div class="{status_class(label)}">
                 <div class="result-title">{Path(result['original_filename']).name}</div>
-                <div class="result-line">{label.title()} | Confidence: {confidence:.2f}% | Rotten: {result['is_rotten']}</div>
-                <div class="small-muted">Fresh: {result['fresh_probability'] * 100:.2f}% | Rotten: {result['rotten_probability'] * 100:.2f}%</div>
+                <div class="verdict-text">{display_label(label)}</div>
+                <div class="small-muted">Confidence: {confidence:.2f}%</div>
+                {object_line}
             </div>
         </div>
         """,
@@ -599,7 +607,6 @@ def render_history_table(history: pd.DataFrame) -> None:
         "source",
         "original_filename",
         "predicted_class",
-        "is_rotten",
         "confidence",
         "fresh_probability",
         "rotten_probability",
@@ -632,22 +639,9 @@ def render_live_inspection(labels: list[str]) -> None:
         "Live Conveyor Inspection",
         "Use this when apples move in front of a fixed webcam. It captures one photo every second and logs each result.",
     )
-    st.markdown(
-        """
-        <div class="mobile-note">
-            Select the webcam facing the conveyor. If you have two webcams, test Camera 0 and Camera 1 first.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
     control_col1, control_col2, control_col3 = st.columns(3)
-    camera_index = control_col1.selectbox(
-        "Live camera source",
-        [0, 1, 2, 3, 4, 5],
-        index=0,
-        format_func=lambda value: f"Camera {value}",
-    )
+    camera_index = control_col1.selectbox("Live camera source", [0, 1, 2, 3], index=0)
     interval_seconds = control_col2.number_input("Seconds between photos", min_value=1, max_value=10, value=1, step=1)
     max_photos = control_col3.number_input("Photos this run", min_value=1, max_value=500, value=60, step=1)
 
@@ -662,13 +656,6 @@ def render_live_inspection(labels: list[str]) -> None:
         st.session_state["live_results"] = []
     if stop_col.button("Stop Live Inspection", use_container_width=True):
         st.session_state["live_running"] = False
-    if st.button("Test Live Camera", use_container_width=True):
-        try:
-            preview_path = test_camera_source(int(camera_index))
-            st.success(f"Camera {camera_index} works.")
-            st.image(str(preview_path), caption=f"Camera {camera_index} preview", use_container_width=True)
-        except RuntimeError as error:
-            st.error(str(error))
 
     latest_box = st.empty()
     progress_box = st.empty()
@@ -682,7 +669,7 @@ def render_live_inspection(labels: list[str]) -> None:
         close_panel()
         return
 
-    camera = cv2.VideoCapture(int(camera_index), CAMERA_BACKEND)
+    camera = cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
     if not camera.isOpened():
         st.session_state["live_running"] = False
         st.error(f"Could not open camera source {camera_index}. Try another source or close other camera apps.")
@@ -695,7 +682,6 @@ def render_live_inspection(labels: list[str]) -> None:
             camera.read()
             time.sleep(0.03)
 
-        model = cached_model()
         for photo_number in range(1, int(max_photos) + 1):
             if not st.session_state.get("live_running", False):
                 break
@@ -708,9 +694,9 @@ def render_live_inspection(labels: list[str]) -> None:
 
             image_path = save_frame(frame, "live")
             history = load_history()
-            prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
+            prediction, confidence, probabilities, object_label, object_confidence = predict_with_not_fruit_check(image_path, labels)
             if prediction == "rotten":
-                beep_for_rotten()
+                winsound.Beep(1200, 500)
             counts = next_counts(history, prediction)
             write_prediction_log(
                 str(image_path),
@@ -725,23 +711,26 @@ def render_live_inspection(labels: list[str]) -> None:
             result = {
                 "photo": photo_number,
                 "prediction": prediction,
-                "is_rotten": prediction == "rotten",
+                "result": display_label(prediction),
                 "confidence": f"{confidence * 100:.2f}%",
                 "fresh_probability": f"{probabilities.get('fresh', 0.0) * 100:.2f}%",
                 "rotten_probability": f"{probabilities.get('rotten', 0.0) * 100:.2f}%",
+                "not_fruit_probability": f"{probabilities.get('not_fruit', 0.0) * 100:.2f}%",
+                "object_check": object_label,
                 "image_path": str(image_path),
             }
             st.session_state["live_results"].insert(0, result)
             st.session_state["live_results"] = st.session_state["live_results"][:50]
 
-            status_class = "status-rotten" if prediction == "rotten" else "status-fresh"
             with latest_box.container():
                 st.markdown(
                     f"""
                     <div class="result-card">
-                        <div class="{status_class}">
+                        <div class="{status_class(prediction)}">
                             <div class="result-title">Live capture #{photo_number}</div>
-                            <div class="result-line">{prediction.title()} | Confidence: {confidence * 100:.2f}% | Rotten: {prediction == 'rotten'}</div>
+                            <div class="verdict-text">{display_label(prediction)}</div>
+                            <div class="small-muted">Confidence: {confidence * 100:.2f}%</div>
+                            <div class="small-muted">Object check: {object_label}</div>
                             <div class="small-muted">Saved image: {image_path.name}</div>
                         </div>
                     </div>
@@ -757,243 +746,6 @@ def render_live_inspection(labels: list[str]) -> None:
         st.success("Live inspection run finished.")
     finally:
         camera.release()
-    close_panel()
-
-
-def open_camera(camera_index: int):
-    camera = cv2.VideoCapture(int(camera_index), CAMERA_BACKEND)
-    if not camera.isOpened():
-        raise RuntimeError(f"Could not open Camera {camera_index}.")
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    for _ in range(20):
-        camera.read()
-        time.sleep(0.03)
-    return camera
-
-
-def analyze_live_frame(frame, camera_name: str, labels: list[str]) -> dict:
-    image_path = save_frame(frame, camera_name.lower().replace(" ", "_"))
-    history = load_history()
-    model = cached_model()
-    prediction, confidence, probabilities = predict_image_file(model, image_path, labels)
-    if prediction == "rotten":
-        beep_for_rotten()
-    counts = next_counts(history, prediction)
-    write_prediction_log(
-        str(image_path),
-        prediction,
-        confidence,
-        counts,
-        probabilities=probabilities,
-        source=camera_name,
-        original_filename=image_path.name,
-    )
-    return {
-        "camera": camera_name,
-        "prediction": prediction,
-        "is_rotten": prediction == "rotten",
-        "confidence": f"{confidence * 100:.2f}%",
-        "fresh_probability": f"{probabilities.get('fresh', 0.0) * 100:.2f}%",
-        "rotten_probability": f"{probabilities.get('rotten', 0.0) * 100:.2f}%",
-        "image_path": str(image_path),
-    }
-
-
-def render_dual_live_inspection(labels: list[str]) -> None:
-    open_panel()
-    section_header(
-        "Dual Camera Live Inspection",
-        "Use this for two webcams on the conveyor. Both cameras capture and analyze one frame every interval.",
-    )
-    st.markdown(
-        """
-        <div class="mobile-note">
-            Plug both webcams into this laptop/PC, test the camera numbers, then start dual inspection.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    control_col1, control_col2, control_col3, control_col4 = st.columns(4)
-    camera_a = control_col1.selectbox(
-        "Camera A",
-        [0, 1, 2, 3, 4, 5],
-        index=0,
-        format_func=lambda value: f"Camera {value}",
-        key="dual_camera_a",
-    )
-    camera_b = control_col2.selectbox(
-        "Camera B",
-        [0, 1, 2, 3, 4, 5],
-        index=1,
-        format_func=lambda value: f"Camera {value}",
-        key="dual_camera_b",
-    )
-    interval_seconds = control_col3.number_input(
-        "Seconds between photos",
-        min_value=1,
-        max_value=10,
-        value=1,
-        step=1,
-        key="dual_interval",
-    )
-    max_cycles = control_col4.number_input(
-        "Cycles this run",
-        min_value=1,
-        max_value=500,
-        value=60,
-        step=1,
-        key="dual_cycles",
-    )
-
-    button_col1, button_col2, button_col3 = st.columns(3)
-    if "dual_live_running" not in st.session_state:
-        st.session_state["dual_live_running"] = False
-    if "dual_live_results" not in st.session_state:
-        st.session_state["dual_live_results"] = []
-
-    if button_col1.button("Test Camera A", use_container_width=True):
-        try:
-            preview_path = test_camera_source(int(camera_a))
-            st.success(f"Camera {camera_a} works.")
-            st.image(str(preview_path), caption=f"Camera {camera_a} preview", use_container_width=True)
-        except RuntimeError as error:
-            st.error(str(error))
-
-    if button_col2.button("Test Camera B", use_container_width=True):
-        try:
-            preview_path = test_camera_source(int(camera_b))
-            st.success(f"Camera {camera_b} works.")
-            st.image(str(preview_path), caption=f"Camera {camera_b} preview", use_container_width=True)
-        except RuntimeError as error:
-            st.error(str(error))
-
-    if button_col3.button("Start Dual Live Inspection", use_container_width=True):
-        if int(camera_a) == int(camera_b):
-            st.error("Camera A and Camera B must be different.")
-        else:
-            st.session_state["dual_live_running"] = True
-            st.session_state["dual_live_results"] = []
-
-    if st.button("Stop Dual Live Inspection", use_container_width=True):
-        st.session_state["dual_live_running"] = False
-
-    latest_col1, latest_col2 = st.columns(2)
-    progress_box = st.empty()
-    table_box = st.empty()
-
-    if not st.session_state["dual_live_running"]:
-        if st.session_state["dual_live_results"]:
-            table_box.dataframe(pd.DataFrame(st.session_state["dual_live_results"]), use_container_width=True, hide_index=True)
-        else:
-            st.info("Dual camera inspection is stopped.")
-        close_panel()
-        return
-
-    camera_a_handle = None
-    camera_b_handle = None
-    try:
-        camera_a_handle = open_camera(int(camera_a))
-        camera_b_handle = open_camera(int(camera_b))
-
-        for cycle_number in range(1, int(max_cycles) + 1):
-            if not st.session_state.get("dual_live_running", False):
-                break
-
-            frame_a = capture_single_frame(camera_a_handle)
-            frame_b = capture_single_frame(camera_b_handle)
-            if frame_a is None or is_blank_frame(frame_a):
-                st.error(f"Camera {camera_a} returned a blank frame.")
-                break
-            if frame_b is None or is_blank_frame(frame_b):
-                st.error(f"Camera {camera_b} returned a blank frame.")
-                break
-
-            result_a = analyze_live_frame(frame_a, f"dual_camera_{camera_a}", labels)
-            result_b = analyze_live_frame(frame_b, f"dual_camera_{camera_b}", labels)
-            result_a["cycle"] = cycle_number
-            result_b["cycle"] = cycle_number
-            st.session_state["dual_live_results"].insert(0, result_b)
-            st.session_state["dual_live_results"].insert(0, result_a)
-            st.session_state["dual_live_results"] = st.session_state["dual_live_results"][:100]
-
-            with latest_col1:
-                result_card(
-                    {
-                        "original_filename": f"Camera {camera_a} cycle {cycle_number}",
-                        "image_path": result_a["image_path"],
-                        "predicted_class": result_a["prediction"],
-                        "is_rotten": result_a["is_rotten"],
-                        "confidence": float(result_a["confidence"].rstrip("%")) / 100,
-                        "fresh_probability": float(result_a["fresh_probability"].rstrip("%")) / 100,
-                        "rotten_probability": float(result_a["rotten_probability"].rstrip("%")) / 100,
-                    }
-                )
-            with latest_col2:
-                result_card(
-                    {
-                        "original_filename": f"Camera {camera_b} cycle {cycle_number}",
-                        "image_path": result_b["image_path"],
-                        "predicted_class": result_b["prediction"],
-                        "is_rotten": result_b["is_rotten"],
-                        "confidence": float(result_b["confidence"].rstrip("%")) / 100,
-                        "fresh_probability": float(result_b["fresh_probability"].rstrip("%")) / 100,
-                        "rotten_probability": float(result_b["rotten_probability"].rstrip("%")) / 100,
-                    }
-                )
-
-            progress_box.progress(cycle_number / int(max_cycles), text=f"Dual capture cycle {cycle_number} of {int(max_cycles)}")
-            table_box.dataframe(pd.DataFrame(st.session_state["dual_live_results"]), use_container_width=True, hide_index=True)
-            time.sleep(float(interval_seconds))
-
-        st.session_state["dual_live_running"] = False
-        st.success("Dual live inspection run finished.")
-    except RuntimeError as error:
-        st.session_state["dual_live_running"] = False
-        st.error(str(error))
-    finally:
-        if camera_a_handle is not None:
-            camera_a_handle.release()
-        if camera_b_handle is not None:
-            camera_b_handle.release()
-    close_panel()
-
-
-def render_website_camera(labels: list[str]) -> None:
-    open_panel()
-    section_header(
-        "Website Camera",
-        "Use this on the deployed website. The browser opens the camera on your phone or laptop, then the app analyzes that photo.",
-    )
-    st.markdown(
-        """
-        <div class="mobile-note">
-            On the deployed website, the server cannot directly control your USB webcams. Use this browser camera option, or upload photos from your device.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    browser_photo = st.camera_input("Take apple photo with this device")
-    if st.button("Analyze Website Camera Photo", use_container_width=True):
-        if browser_photo is None:
-            st.warning("Take a camera photo first.")
-        else:
-            try:
-                saved_path = save_uploaded_image(browser_photo)
-                refreshed_history = load_history()
-                result = inspect_saved_image(
-                    saved_path,
-                    getattr(browser_photo, "name", "website_camera.jpg"),
-                    "website_camera",
-                    refreshed_history,
-                    labels,
-                )
-                st.session_state["batch_results"] = [result]
-                st.success("Website camera photo analyzed.")
-                result_card(result)
-            except FileNotFoundError as error:
-                st.error(str(error))
     close_panel()
 
 
@@ -1017,8 +769,8 @@ def main() -> None:
     history = load_history()
     render_metrics(history)
 
-    inspect_tab, dual_live_tab, website_camera_tab, live_tab, learn_tab, history_tab = st.tabs(
-        ["Batch Inspection", "Dual Camera Live", "Website Camera", "Live Inspection", "Feedback & Learning", "History"]
+    inspect_tab, live_tab, learn_tab, history_tab = st.tabs(
+        ["Batch Inspection", "Live Inspection", "Feedback & Learning", "History"]
     )
 
     with inspect_tab:
@@ -1047,56 +799,16 @@ def main() -> None:
                         st.error(str(error))
 
             st.divider()
-            section_header("Mobile Camera", "On phone, use this to take a photo with the browser camera and analyze it.")
-            st.markdown(
-                """
-                <div class="mobile-note">
-                    For mobile/cloud use, this is the best camera option. The OpenCV webcam buttons below are mainly for the local conveyor PC.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            mobile_photo = st.camera_input("Take one apple photo")
-            if st.button("Analyze Mobile Photo", use_container_width=True):
-                if mobile_photo is None:
-                    st.warning("Take a mobile camera photo first.")
-                else:
-                    try:
-                        saved_path = save_uploaded_image(mobile_photo)
-                        refreshed_history = load_history()
-                        result = inspect_saved_image(
-                            saved_path,
-                            getattr(mobile_photo, "name", "mobile_camera.jpg"),
-                            "mobile_camera",
-                            refreshed_history,
-                            labels,
-                        )
-                        st.session_state["batch_results"] = [result]
-                        st.rerun()
-                    except FileNotFoundError as error:
-                        st.error(str(error))
-
-            st.divider()
-            section_header("Multi-Camera Capture", "Choose which webcam should capture the apple image.")
+            section_header("Camera Capture", "Capture one photo from the webcam and analyze it immediately.")
             camera_index = st.selectbox(
                 "Camera source",
-                options=[0, 1, 2, 3, 4, 5],
+                options=[0, 1, 2, 3],
                 index=0,
-                format_func=lambda value: f"Camera {value}",
-                help="Try Camera 0, then 1, then 2 to find your USB webcams.",
+                help="If the saved photo is blank, try camera 1 or 2.",
             )
-            camera_col1, camera_col2, camera_col3 = st.columns(3)
-            test_clicked = camera_col1.button("Test Camera", use_container_width=True)
-            instant_clicked = camera_col2.button("Instant Photo", use_container_width=True)
-            countdown_clicked = camera_col3.button("3 Second Countdown", use_container_width=True)
-
-            if test_clicked:
-                try:
-                    preview_path = test_camera_source(camera_index)
-                    st.success(f"Camera {camera_index} works.")
-                    st.image(str(preview_path), caption=f"Camera {camera_index} preview", use_container_width=True)
-                except RuntimeError as error:
-                    st.error(str(error))
+            camera_col1, camera_col2 = st.columns(2)
+            instant_clicked = camera_col1.button("Instant Photo", use_container_width=True)
+            countdown_clicked = camera_col2.button("3 Second Countdown", use_container_width=True)
 
             if instant_clicked or countdown_clicked:
                 try:
@@ -1147,12 +859,6 @@ def main() -> None:
     with live_tab:
         render_live_inspection(labels)
 
-    with dual_live_tab:
-        render_dual_live_inspection(labels)
-
-    with website_camera_tab:
-        render_website_camera(labels)
-
     with learn_tab:
         open_panel()
         section_header("Review AI Answer", "Tell the system whether a prediction was correct, then retrain when you are ready.")
@@ -1178,22 +884,26 @@ def main() -> None:
                     st.warning("Image file for this record was not found.")
             with review_right:
                 predicted = str(selected.get("predicted_class", ""))
-                corrected = opposite_label(predicted)
-                st.markdown(f"**AI prediction:** `{predicted}`")
-                st.markdown(f"**If wrong, it will be saved as:** `{corrected}`")
+                label_options = ["fresh", "rotten", "not_fruit"]
+                default_index = label_options.index(predicted) if predicted in label_options else 2
+                st.markdown(f"**AI prediction:** `{display_label(predicted)}`")
+                feedback_label = st.radio(
+                    "Correct label",
+                    label_options,
+                    index=default_index,
+                    horizontal=True,
+                    format_func=display_label,
+                )
 
-                correct_col, wrong_col = st.columns(2)
-                if correct_col.button("AI Is Correct", use_container_width=True):
-                    saved = save_feedback(selected, predicted, True)
-                    st.success(f"Added to training data as {predicted}: {saved}")
-                if wrong_col.button("AI Is Wrong", use_container_width=True):
-                    saved = save_feedback(selected, corrected, False)
-                    st.success(f"Added corrected training data as {corrected}: {saved}")
+                if st.button("Save Feedback Label", use_container_width=True):
+                    ai_was_correct = feedback_label == predicted
+                    saved = save_feedback(selected, feedback_label, ai_was_correct)
+                    st.success(f"Added to training data as {display_label(feedback_label)}: {saved}")
 
                 st.divider()
                 section_header(
                     "Retrain After Feedback",
-                    "Feedback is saved immediately. Retraining updates the actual model, but it can take several minutes.",
+                    "Feedback is saved immediately. Add several Not a fruit examples, then retrain to teach the model the new category.",
                 )
                 if st.button("Retrain Model With Feedback", use_container_width=True):
                     with st.spinner("Splitting data and retraining model. Keep this page open."):
