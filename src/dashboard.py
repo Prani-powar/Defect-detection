@@ -4,12 +4,17 @@ import shutil
 import subprocess
 import sys
 import time
-import winsound
+
+try:
+    import winsound
+except ModuleNotFoundError:
+    winsound = None
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.applications.mobilenet_v2 import decode_predictions, preprocess_input
 from tensorflow.keras.preprocessing import image as keras_image
@@ -312,6 +317,38 @@ def status_class(label: str) -> str:
     return "status-uncertain"
 
 
+def play_rotten_alert() -> None:
+    if winsound is not None:
+        winsound.Beep(1200, 500)
+        return
+    components.html(
+        """
+        <script>
+        (() => {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) return;
+
+            const context = new AudioContext();
+            const oscillator = context.createOscillator();
+            const gain = context.createGain();
+
+            oscillator.type = "sine";
+            oscillator.frequency.value = 1200;
+            gain.gain.setValueAtTime(0.18, context.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.5);
+
+            oscillator.connect(gain);
+            gain.connect(context.destination);
+            oscillator.start();
+            oscillator.stop(context.currentTime + 0.5);
+            setTimeout(() => context.close(), 650);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def detect_fruit_like(image_path: Path) -> tuple[bool, str, float]:
     object_model = cached_object_model()
     if object_model is None:
@@ -453,7 +490,7 @@ def inspect_saved_image(
 ) -> dict:
     prediction, confidence, probabilities, object_label, object_confidence = predict_with_not_fruit_check(image_path, labels)
     if prediction == "rotten":
-        winsound.Beep(1200, 500)
+        play_rotten_alert()
     counts = next_counts(history, prediction)
     write_prediction_log(
         str(image_path),
@@ -696,7 +733,7 @@ def render_live_inspection(labels: list[str]) -> None:
             history = load_history()
             prediction, confidence, probabilities, object_label, object_confidence = predict_with_not_fruit_check(image_path, labels)
             if prediction == "rotten":
-                winsound.Beep(1200, 500)
+                play_rotten_alert()
             counts = next_counts(history, prediction)
             write_prediction_log(
                 str(image_path),
