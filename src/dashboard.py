@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -317,6 +318,10 @@ def status_class(label: str) -> str:
     return "status-uncertain"
 
 
+def use_local_opencv_camera() -> bool:
+    return sys.platform.startswith("win")
+
+
 def play_rotten_alert() -> None:
     if winsound is not None:
         winsound.Beep(1200, 500)
@@ -396,11 +401,15 @@ def predict_with_not_fruit_check(image_path: Path, labels: list[str]) -> tuple[s
 
 def save_uploaded_image(uploaded_file) -> Path:
     ensure_directories([LOG_IMAGE_DIR])
-    suffix = Path(uploaded_file.name).suffix.lower() or ".jpg"
-    safe_name = Path(uploaded_file.name).stem.replace(" ", "_")[:40]
+    original_name = getattr(uploaded_file, "name", "browser_camera.jpg") or "browser_camera.jpg"
+    suffix = Path(original_name).suffix.lower() or ".jpg"
+    safe_name = Path(original_name).stem.replace(" ", "_")[:40]
     output_path = LOG_IMAGE_DIR / f"upload_{timestamp_string()}_{safe_name}{suffix}"
     with output_path.open("wb") as handle:
-        shutil.copyfileobj(uploaded_file, handle)
+        if hasattr(uploaded_file, "getbuffer"):
+            handle.write(uploaded_file.getbuffer())
+        else:
+            shutil.copyfileobj(uploaded_file, handle)
     return output_path
 
 
@@ -541,6 +550,17 @@ def inspect_uploaded_files(uploaded_files: list, history: pd.DataFrame, labels: 
     return results
 
 
+def inspect_browser_camera_photo(uploaded_photo, source: str, labels: list[str], history: pd.DataFrame) -> dict:
+    saved_path = save_uploaded_image(uploaded_photo)
+    return inspect_saved_image(
+        saved_path,
+        getattr(uploaded_photo, "name", "browser_camera.jpg"),
+        source,
+        history,
+        labels,
+    )
+
+
 def result_card(result: dict) -> None:
     label = str(result["predicted_class"])
     confidence = float(result["confidence"]) * 100
@@ -670,7 +690,67 @@ def close_panel() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def render_browser_live_inspection(labels: list[str]) -> None:
+    open_panel()
+    section_header(
+        "Live Camera Inspection",
+        "Use this on the deployed website. The browser opens your device camera, then the app analyzes each captured photo.",
+    )
+    st.info(
+        "On Streamlit Cloud, the server cannot open your laptop USB camera with camera source 0. "
+        "This browser camera uses the camera from the device you are viewing the website on."
+    )
+
+    browser_photo = st.camera_input("Take one inspection photo", key="browser_live_camera")
+    auto_analyze = st.toggle("Analyze each new camera photo automatically", value=True)
+    analyze_clicked = st.button("Analyze Camera Photo", use_container_width=True)
+
+    if "browser_live_results" not in st.session_state:
+        st.session_state["browser_live_results"] = []
+
+    if browser_photo is None:
+        st.info("Allow camera permission in the browser, then take a photo.")
+        if st.session_state["browser_live_results"]:
+            st.dataframe(pd.DataFrame(st.session_state["browser_live_results"]), use_container_width=True, hide_index=True)
+        close_panel()
+        return
+
+    photo_hash = hashlib.sha256(browser_photo.getvalue()).hexdigest()
+    should_analyze = analyze_clicked or (
+        auto_analyze and st.session_state.get("last_browser_live_hash") != photo_hash
+    )
+
+    if should_analyze:
+        with st.spinner("Analyzing camera photo..."):
+            result = inspect_browser_camera_photo(browser_photo, "browser_live_camera", labels, load_history())
+        st.session_state["last_browser_live_hash"] = photo_hash
+        st.session_state["batch_results"] = [result]
+        st.session_state["browser_live_latest"] = result
+        st.session_state["browser_live_results"].insert(
+            0,
+            {
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "result": display_label(str(result["predicted_class"])),
+                "confidence": f"{float(result['confidence']) * 100:.2f}%",
+                "image_path": result["image_path"],
+            },
+        )
+        st.session_state["browser_live_results"] = st.session_state["browser_live_results"][:50]
+
+    latest = st.session_state.get("browser_live_latest")
+    if latest:
+        result_card(latest)
+
+    if st.session_state["browser_live_results"]:
+        st.dataframe(pd.DataFrame(st.session_state["browser_live_results"]), use_container_width=True, hide_index=True)
+    close_panel()
+
+
 def render_live_inspection(labels: list[str]) -> None:
+    if not use_local_opencv_camera():
+        render_browser_live_inspection(labels)
+        return
+
     open_panel()
     section_header(
         "Live Conveyor Inspection",
@@ -836,34 +916,51 @@ def main() -> None:
                         st.error(str(error))
 
             st.divider()
-            section_header("Camera Capture", "Capture one photo from the webcam and analyze it immediately.")
-            camera_index = st.selectbox(
-                "Camera source",
-                options=[0, 1, 2, 3],
-                index=0,
-                help="If the saved photo is blank, try camera 1 or 2.",
-            )
-            camera_col1, camera_col2 = st.columns(2)
-            instant_clicked = camera_col1.button("Instant Photo", use_container_width=True)
-            countdown_clicked = camera_col2.button("3 Second Countdown", use_container_width=True)
+            if use_local_opencv_camera():
+                section_header("Camera Capture", "Capture one photo from the webcam and analyze it immediately.")
+                camera_index = st.selectbox(
+                    "Camera source",
+                    options=[0, 1, 2, 3],
+                    index=0,
+                    help="If the saved photo is blank, try camera 1 or 2.",
+                )
+                camera_col1, camera_col2 = st.columns(2)
+                instant_clicked = camera_col1.button("Instant Photo", use_container_width=True)
+                countdown_clicked = camera_col2.button("3 Second Countdown", use_container_width=True)
 
-            if instant_clicked or countdown_clicked:
-                try:
-                    seconds = 3 if countdown_clicked else 0
-                    with st.spinner("Opening webcam..."):
-                        captured_path = capture_webcam_image(camera_index, seconds)
-                    refreshed_history = load_history()
-                    result = inspect_saved_image(
-                        captured_path,
-                        captured_path.name,
-                        "webcam_countdown" if countdown_clicked else "webcam_instant",
-                        refreshed_history,
-                        labels,
-                    )
-                    st.session_state["batch_results"] = [result]
-                    st.rerun()
-                except RuntimeError as error:
-                    st.error(str(error))
+                if instant_clicked or countdown_clicked:
+                    try:
+                        seconds = 3 if countdown_clicked else 0
+                        with st.spinner("Opening webcam..."):
+                            captured_path = capture_webcam_image(camera_index, seconds)
+                        refreshed_history = load_history()
+                        result = inspect_saved_image(
+                            captured_path,
+                            captured_path.name,
+                            "webcam_countdown" if countdown_clicked else "webcam_instant",
+                            refreshed_history,
+                            labels,
+                        )
+                        st.session_state["batch_results"] = [result]
+                        st.rerun()
+                    except RuntimeError as error:
+                        st.error(str(error))
+            else:
+                section_header("Browser Camera Capture", "Use your laptop or phone camera through the website browser.")
+                browser_photo = st.camera_input("Take one apple inspection photo", key="batch_browser_camera")
+                if st.button("Analyze Browser Camera Photo", use_container_width=True):
+                    if browser_photo is None:
+                        st.warning("Allow camera permission and take a photo first.")
+                    else:
+                        with st.spinner("Analyzing browser camera photo..."):
+                            result = inspect_browser_camera_photo(
+                                browser_photo,
+                                "browser_camera",
+                                labels,
+                                load_history(),
+                            )
+                        st.session_state["batch_results"] = [result]
+                        st.rerun()
             close_panel()
 
         with right:
